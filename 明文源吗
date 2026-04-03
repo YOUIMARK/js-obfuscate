@@ -31,33 +31,35 @@ const UPSTREAM_HEADERS = Object.freeze({
   'Accept':       'application/dns-message',
 });
 
+// DNS 协议相关常量提取，消除魔法数字
+const DNS_CONSTANTS = Object.freeze({
+  HEADER_SIZE: 12,
+  OFFSET_QD: 4,
+  OFFSET_AN: 6,
+  OFFSET_NS: 8,
+  OFFSET_AR: 10,
+  TYPE_OPT: 41,
+  ECS_OPTION_CODE: 8
+});
+
 // ================================================================
 // 平台检测（模块加载时一次性执行，结果缓存为常量 PLATFORM）
 // ================================================================
 
 const detectPlatform = () => {
-  // Netlify Edge Functions 运行在 Deno 上
   if (typeof Deno !== 'undefined' && typeof Deno.env?.get === 'function') return 'netlify';
-  // Vercel Edge Functions 有 Node.js process
   if (typeof process !== 'undefined' && process.env) return 'vercel';
-  // 默认为 Cloudflare Workers/Pages
   return 'cloudflare';
 };
 
-/** 运行平台，模块加载时一次性确定，整个生命周期内不会改变 */
 const PLATFORM = detectPlatform();
 
-/**
- * 读取环境变量。
- * 直接使用缓存的 PLATFORM，避免每次请求重复检测。
- */
 const getEnv = (key, env) => {
   if (PLATFORM === 'netlify') return Deno.env.get(key);
   if (PLATFORM === 'vercel')  return process.env[key];
   return env?.[key];
 };
 
-// 各平台客户端 IP 请求头，按优先级从高到低排列
 const CLIENT_IP_HEADERS = Object.freeze({
   cloudflare: ['EO-Client-IP', 'ali-real-client-ip', 'CF-Connecting-IP',          'X-Forwarded-For', 'X-Real-IP'],
   vercel:     ['EO-Client-IP', 'ali-real-client-ip', 'X-Vercel-Forwarded-For',    'X-Forwarded-For', 'X-Real-IP'],
@@ -67,14 +69,18 @@ const CLIENT_IP_HEADERS = Object.freeze({
 const errResp  = (body, status) => new Response(body, { status, headers: CORS_HEADERS });
 const capitalize = str => str.charAt(0).toUpperCase() + str.slice(1);
 
+// 自定义错误工厂，提升代码可维护性
+const createCustomError = (name, message, cause) => {
+  const err = new Error(message);
+  err.name = name;
+  if (cause) err.cause = cause;
+  return err;
+};
+
 // ================================================================
 // 工具函数
 // ================================================================
 
-/**
- * 为 fetch 调用添加超时控制。
- * 超时时抛出 name==='TimeoutError' 的错误，以便调用方区分超时与其他失败。
- */
 const withTimeout = async (fetchFn, ms) => {
   if (ms <= 0) throw new Error('Timeout must be positive');
   const controller = new AbortController();
@@ -83,10 +89,7 @@ const withTimeout = async (fetchFn, ms) => {
     return await fetchFn(controller.signal);
   } catch (err) {
     if (err.name === 'AbortError') {
-      const e = new Error('Timeout');
-      e.name  = 'TimeoutError';
-      e.cause = err;           // 保留原始错误链，便于调试
-      throw e;
+      throw createCustomError('TimeoutError', 'Timeout', err);
     }
     throw err;
   } finally {
@@ -94,12 +97,7 @@ const withTimeout = async (fetchFn, ms) => {
   }
 };
 
-/**
- * 从请求头或平台上下文中提取客户端真实 IP。
- * 使用缓存的 PLATFORM，不再需要外部传入 platform 参数。
- */
 const getClientIP = (headers, context) => {
-  // Netlify 通过 context.ip 直接提供
   if (PLATFORM === 'netlify' && context?.ip) {
     const ip = context.ip.trim().replace(/^\[|\]$/g, '');
     if (ip) return ip;
@@ -114,16 +112,8 @@ const getClientIP = (headers, context) => {
   return null;
 };
 
-/**
- * 路径段有效性检查：去除空段、点开头（隐藏文件）及目录穿越符。
- * 由 safeDecodePath 和 encodeDevicePath 共同使用，保证一致性。
- */
 const isValidSegment = seg => seg !== '' && !seg.startsWith('.') && seg !== '..';
 
-/**
- * 安全解码 URL 路径，防止路径穿越攻击。
- * 循环解码直至稳定，以抵御双重编码绕过（如 %252e%252e）。
- */
 const safeDecodePath = (raw) => {
   if (!raw || raw === '/') return '';
   try {
@@ -136,14 +126,12 @@ const safeDecodePath = (raw) => {
   }
 };
 
-/** 对设备路径各段进行百分号编码，使其可安全拼接到上游 URL。 */
 const encodeDevicePath = (devicePath) => {
   if (!devicePath) return '';
   const segments = devicePath.split('/').filter(isValidSegment).map(encodeURIComponent);
   return segments.length > 0 ? '/' + segments.join('/') : '';
 };
 
-/** 将 Base64URL 字符串解码为 Uint8Array。 */
 function base64urlDecode(s) {
   if (typeof s !== 'string') throw new TypeError('Input must be a string');
   if (s.length % 4 === 1) throw new Error('Invalid base64url length');
@@ -204,14 +192,19 @@ function skipRR(buf, off) {
 }
 
 function findSections(buf) {
-  if (buf.length < 12) throw new RangeError('DNS message too short');
-  const qd = readU16(buf, 4), an = readU16(buf, 6),
-        ns = readU16(buf, 8), ar = readU16(buf, 10);
-  let off = 12;
-  for (let i = 0; i < qd; i++) off = skipQuestion(buf, off);
-  for (let i = 0; i < an; i++) off = skipRR(buf, off);
-  for (let i = 0; i < ns; i++) off = skipRR(buf, off);
-  return { ar, additionalStart: off };
+  if (buf.length < DNS_CONSTANTS.HEADER_SIZE) throw new RangeError('DNS message too short');
+  
+  const qdCount = readU16(buf, DNS_CONSTANTS.OFFSET_QD);
+  const anCount = readU16(buf, DNS_CONSTANTS.OFFSET_AN);
+  const nsCount = readU16(buf, DNS_CONSTANTS.OFFSET_NS);
+  const arCount = readU16(buf, DNS_CONSTANTS.OFFSET_AR);
+  
+  let off = DNS_CONSTANTS.HEADER_SIZE;
+  for (let i = 0; i < qdCount; i++) off = skipQuestion(buf, off);
+  for (let i = 0; i < anCount; i++) off = skipRR(buf, off);
+  for (let i = 0; i < nsCount; i++) off = skipRR(buf, off);
+  
+  return { arCount, additionalStart: off };
 }
 
 function parseAdditionalRecords(buf, arStart, arCount) {
@@ -221,10 +214,12 @@ function parseAdditionalRecords(buf, arStart, arCount) {
     if (off >= buf.length) break;
     const nameEnd = skipName(buf, off);
     if (nameEnd + 10 > buf.length) throw new RangeError('Additional RR header truncated');
+    
     const type       = readU16(buf, nameEnd);
     const rdlen      = readU16(buf, nameEnd + 8);
     const rdataStart = nameEnd + 10;
     const rdataEnd   = rdataStart + rdlen;
+    
     if (rdataEnd > buf.length) throw new RangeError('Additional RR rdata truncated');
     recs.push({ nameEnd, type, rdataStart, rdataEnd });
     off = rdataEnd;
@@ -249,12 +244,12 @@ function buildEcsOption(ipBytes, family, prefixLen) {
   const count   = Math.ceil(prefixLen / 8);
   const trimmed = new Uint8Array(count);
   for (let i = 0; i < Math.min(count, ipBytes.length); i++) {
-    trimmed[i] = ipBytes[i];   // i 始终在 ipBytes 范围内，无需 || 0 fallback
+    trimmed[i] = ipBytes[i];
   }
   const rem = prefixLen % 8;
   if (rem && count > 0) trimmed[count - 1] &= (0xff << (8 - rem));
   const optData = concatUint8(writeU16BE(family), new Uint8Array([prefixLen & 0xff, 0]), trimmed);
-  return concatUint8(writeU16BE(8), writeU16BE(optData.length), optData);
+  return concatUint8(writeU16BE(DNS_CONSTANTS.ECS_OPTION_CODE), writeU16BE(optData.length), optData);
 }
 
 function injectECS(buf, clientIp) {
@@ -268,12 +263,12 @@ function injectECS(buf, clientIp) {
     console.warn('Could not build ECS option:', e.message);
     return buf;
   }
-  const { ar, additionalStart } = findSections(buf);
-  const addRecs = parseAdditionalRecords(buf, additionalStart, ar);
-  const optIdx  = addRecs.findIndex(r => r.type === 41);
+  
+  const { arCount, additionalStart } = findSections(buf);
+  const addRecs = parseAdditionalRecords(buf, additionalStart, arCount);
+  const optIdx  = addRecs.findIndex(r => r.type === DNS_CONSTANTS.TYPE_OPT);
 
   if (optIdx !== -1) {
-    // 已有 OPT RR：替换其中的 ECS option（code=8），保留其他 options
     const rec     = addRecs[optIdx];
     const options = [];
     let p = rec.rdataStart;
@@ -282,7 +277,7 @@ function injectECS(buf, clientIp) {
       const len    = readU16(buf, p + 2);
       const optEnd = p + 4 + len;
       if (optEnd > rec.rdataEnd) break;
-      if (code !== 8) options.push(buf.slice(p, optEnd));
+      if (code !== DNS_CONSTANTS.ECS_OPTION_CODE) options.push(buf.slice(p, optEnd));
       p = optEnd;
     }
     const newRdata = concatUint8(...options, ecsOpt);
@@ -294,19 +289,18 @@ function injectECS(buf, clientIp) {
     );
   }
 
-  // 没有 OPT RR：追加一条新的，ARCOUNT +1
   const optRecord = concatUint8(
     new Uint8Array([0x00]),
-    writeU16BE(41),
+    writeU16BE(DNS_CONSTANTS.TYPE_OPT),
     writeU16BE(4096),
     new Uint8Array([0, 0, 0, 0]),
     writeU16BE(ecsOpt.length),
     ecsOpt
   );
   const newBuf = concatUint8(buf, optRecord);
-  const ar2    = ar + 1;
-  newBuf[10] = (ar2 >> 8) & 0xff;
-  newBuf[11] = ar2 & 0xff;
+  const newArCount = arCount + 1;
+  newBuf[DNS_CONSTANTS.OFFSET_AR] = (newArCount >> 8) & 0xff;
+  newBuf[DNS_CONSTANTS.OFFSET_AR + 1] = newArCount & 0xff;
   return newBuf;
 }
 
@@ -335,14 +329,13 @@ function parseIPv6(str) {
   let main = str, v4bytes = null;
   const lastColon = str.lastIndexOf(':'), lastDot = str.lastIndexOf('.');
   if (lastDot > lastColon) {
-    // IPv4-mapped 尾部，如 ::ffff:192.0.2.1
     v4bytes = parseIPv4(str.slice(lastColon + 1));
     if (!v4bytes) return null;
     main = str.slice(0, lastColon);
   }
   const parts = main.split('::');
-  if (parts.length > 2) return null;           // 多个 :: 是非法地址
-  const hasElision = parts.length === 2;        // 是否有 :: 省略符
+  if (parts.length > 2) return null;
+  const hasElision = parts.length === 2;
   const left  = parts[0] ? parts[0].split(':').filter(Boolean) : [];
   const right = parts[1] ? parts[1].split(':').filter(Boolean) : [];
   if (left.some(h => !HEX_GROUP.test(h)) || right.some(h => !HEX_GROUP.test(h))) return null;
@@ -351,8 +344,6 @@ function parseIPv6(str) {
   if (leftVals.some(Number.isNaN) || rightVals.some(Number.isNaN)) return null;
   const groupCount = leftVals.length + rightVals.length + (v4bytes ? 2 : 0);
   const missing    = 8 - groupCount;
-  // [BUG FIX] 无 :: 省略符时，组数必须恰好为 8，不允许零填充。
-  // 原代码仅检查 missing < 0，导致如 "2001:db8:1:2:3:4:5"（7 组无 ::）被错误解析。
   if (!hasElision && missing !== 0) return null;
   if (missing < 0) return null;
   const words = [...leftVals, ...Array(missing).fill(0), ...rightVals];
@@ -426,14 +417,9 @@ function isPublicIp(ip) {
 }
 
 // ================================================================
-// 请求解析辅助函数（从 handleRequest 中提取，降低函数复杂度）
+// 请求解析辅助函数
 // ================================================================
 
-/**
- * 解析并验证运行时配置。
- * @returns {{ ids: string[], primaryTimeoutMs: number, fallbackUrl: string }}
- *        | {{ error: string }}
- */
 function parseConfig(env) {
   const idsStr = getEnv('NEXTDNS_ID', env) || '';
   if (!idsStr.trim()) return { error: 'Server misconfiguration: NEXTDNS_ID not set' };
@@ -442,24 +428,23 @@ function parseConfig(env) {
     .map(s => s.trim().replace(/[^a-zA-Z0-9_-]/g, ''))
     .filter(Boolean);
   if (ids.length === 0) return { error: 'Server misconfiguration: No valid NEXTDNS_ID found' };
+  
   const rawTimeout = getEnv('TIMEOUT_MS', env);
   const parsed     = rawTimeout ? parseInt(rawTimeout, 10) : NaN;
   const primaryTimeoutMs = Number.isFinite(parsed) && parsed > 0
     ? Math.min(parsed, MAX_TIMEOUT_MS)
     : DEFAULT_TIMEOUT_MS;
+    
   let fallbackUrl;
   try {
     fallbackUrl = new URL(getEnv('FALLBACK_URL', env) || DEFAULT_FALLBACK).toString();
   } catch {
     fallbackUrl = DEFAULT_FALLBACK;
   }
+  
   return { ids, primaryTimeoutMs, fallbackUrl };
 }
 
-/**
- * 解析当前平台的请求路径，提取设备路径。
- * @returns {{ devicePath: string }} | {{ error: string, status: number }}
- */
 function parsePath(clientUrl, env) {
   if (PLATFORM === 'cloudflare') {
     const normalizedBase = (getEnv('BASE_PATH', env) || '').replace(/^\/+|\/+$/g, '');
@@ -469,7 +454,7 @@ function parsePath(clientUrl, env) {
     }
     return { devicePath: safeDecodePath(clientUrl.pathname.substring(basePath.length)) };
   }
-  // Vercel / Netlify
+  
   const mountPath = (getEnv('MOUNT_PATH', env) || '').replace(/^\/+|\/+$/g, '');
   const basePath  = `/${mountPath || 'youimark'}`;
   if (clientUrl.pathname !== basePath && !clientUrl.pathname.startsWith(basePath + '/')) {
@@ -478,13 +463,10 @@ function parsePath(clientUrl, env) {
   const devicePath = PLATFORM === 'vercel'
     ? safeDecodePath(clientUrl.searchParams.get('__path') || '')
     : safeDecodePath(clientUrl.pathname.slice(basePath.length));
+    
   return { devicePath };
 }
 
-/**
- * 从 HTTP 请求中读取并验证 DNS wire-format 数据。
- * @returns {{ wire: Uint8Array }} | {{ response: Response }}
- */
 async function parseDnsRequest(request, clientUrl) {
   if (request.method === 'GET') {
     const dnsParam = clientUrl.searchParams.get('dns');
@@ -496,16 +478,15 @@ async function parseDnsRequest(request, clientUrl) {
       return { response: errResp('Invalid dns parameter', 400) };
     }
   }
-  // POST
+  
   const ct = request.headers.get('Content-Type') || '';
   if (!ct.startsWith('application/dns-message')) {
     return { response: errResp('Unsupported Media Type', 415) };
   }
+  
   const cl = request.headers.get('Content-Length');
   if (cl !== null) {
     const clNum = parseInt(cl, 10);
-    // [BUG FIX] 原代码对无效值（NaN）和超大值均返回 413，
-    // 无效/负数 Content-Length 应返回 400 Bad Request。
     if (!Number.isFinite(clNum) || clNum < 0) {
       return { response: errResp('Bad Request', 400) };
     }
@@ -513,6 +494,7 @@ async function parseDnsRequest(request, clientUrl) {
       return { response: errResp('Payload Too Large', 413) };
     }
   }
+  
   try {
     const buf = await request.arrayBuffer();
     if (buf.byteLength > MAX_BODY) return { response: errResp('Payload Too Large', 413) };
@@ -528,32 +510,26 @@ async function parseDnsRequest(request, clientUrl) {
 // ================================================================
 
 async function handleRequest(request, env, context) {
-  // CORS 预检
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
-  // 方法验证
   if (!['GET', 'POST'].includes(request.method)) {
     return errResp('Method Not Allowed', 405);
   }
 
-  // --- 配置解析 ---
   const config = parseConfig(env);
   if ('error' in config) return errResp(config.error, 500);
 
-  // --- 路径解析 ---
   const clientUrl = new URL(request.url);
   const pathResult = parsePath(clientUrl, env);
   if ('error' in pathResult) return errResp(pathResult.error, pathResult.status);
 
-  // --- DNS 请求解析 ---
   const dnsResult = await parseDnsRequest(request, clientUrl);
   if ('response' in dnsResult) return dnsResult.response;
   const { wire: dnsWire } = dnsResult;
 
-  if (dnsWire.length < 12) return errResp('Invalid DNS message', 400);
+  if (dnsWire.length < DNS_CONSTANTS.HEADER_SIZE) return errResp('Invalid DNS message', 400);
 
-  // --- ECS 注入 ---
   const clientIP = getClientIP(request.headers, context);
   let mutatedWire = dnsWire;
   if (isPublicIp(clientIP)) {
@@ -561,12 +537,9 @@ async function handleRequest(request, env, context) {
       mutatedWire = injectECS(dnsWire, clientIP);
     } catch (e) {
       console.warn('Failed to inject ECS:', e.message);
-      // 注入失败时静默降级，使用原始 DNS 消息
     }
   }
 
-  // --- 上游请求 ---
-  // tryFetch 返回结构体而非 Response，避免 fallback 分支二次读取响应体。
   const tryFetch = async (upstreamUrl, signal) => {
     const req = new Request(upstreamUrl, {
       method: 'POST',
@@ -577,26 +550,22 @@ async function handleRequest(request, env, context) {
     });
     const response = await fetch(req);
     if (response.status >= 500) {
-      const err = new Error(`Upstream error: ${response.status}`);
-      err.name = 'UpstreamError';
-      throw err;
+      throw createCustomError('UpstreamError', `Upstream error: ${response.status}`);
     }
-    // 先检查 Content-Length，防止大响应占用内存
+    
     const contentLength = response.headers.get('Content-Length');
     if (contentLength) {
       const len = parseInt(contentLength, 10);
       if (Number.isFinite(len) && len > MAX_RESPONSE) {
-        const err = new Error(`Response too large: ${len} bytes`);
-        err.name = 'ResponseTooLargeError';
-        throw err;
+        throw createCustomError('ResponseTooLargeError', `Response too large: ${len} bytes`);
       }
     }
+    
     const body = await response.arrayBuffer();
     if (body.byteLength > MAX_RESPONSE) {
-      const err = new Error(`Response too large: ${body.byteLength} bytes`);
-      err.name = 'ResponseTooLargeError';
-      throw err;
+      throw createCustomError('ResponseTooLargeError', `Response too large: ${body.byteLength} bytes`);
     }
+    
     const respHeaders = new Headers(response.headers);
     respHeaders.delete('Transfer-Encoding');
     respHeaders.delete('Content-Encoding');
@@ -619,7 +588,6 @@ async function handleRequest(request, env, context) {
     console.warn('Primary upstream failed:', primaryErr.message);
     try {
       const result = await withTimeout(signal => tryFetch(config.fallbackUrl, signal), FALLBACK_TIMEOUT_MS);
-      // 直接修改结构体的 Headers，无需二次读取响应体
       result.headers.set('X-Fallback', primaryErr.name === 'TimeoutError' ? 'primary-timeout' : 'primary-error');
       return buildResponse(result);
     } catch (fallbackErr) {
@@ -633,7 +601,6 @@ async function handleRequest(request, env, context) {
 // 平台导出（自动适配）
 // ================================================================
 
-// Cloudflare Workers / Pages（作为 _worker.js 使用）
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -645,7 +612,6 @@ export default {
   },
 };
 
-// Cloudflare Pages Functions
 export async function onRequest(context) {
   try {
     return await handleRequest(context.request, context.env, context);
@@ -655,5 +621,4 @@ export async function onRequest(context) {
   }
 }
 
-// Vercel Edge 运行时配置
 export const config = { runtime: 'edge' };
