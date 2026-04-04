@@ -66,7 +66,13 @@ const CLIENT_IP_HEADERS = Object.freeze({
   netlify:    ['EO-Client-IP', 'ali-real-client-ip', 'X-Nf-Client-Connection-Ip', 'X-Forwarded-For', 'X-Real-IP'],
 });
 
-const errResp  = (body, status) => new Response(body, { status, headers: CORS_HEADERS });
+// [修改1] errResp 补充 Content-Type，符合 HTTP 规范
+// 原因：错误响应体是纯文本，浏览器和客户端需要 Content-Type 才能正确解析
+const errResp = (body, status) => new Response(body, {
+  status,
+  headers: { ...CORS_HEADERS, 'Content-Type': 'text/plain;charset=UTF-8' },
+});
+
 const capitalize = str => str.charAt(0).toUpperCase() + str.slice(1);
 
 // 自定义错误工厂，提升代码可维护性
@@ -252,13 +258,14 @@ function buildEcsOption(ipBytes, family, prefixLen) {
   return concatUint8(writeU16BE(DNS_CONSTANTS.ECS_OPTION_CODE), writeU16BE(optData.length), optData);
 }
 
-function injectECS(buf, clientIp) {
-  const ip = parseIp(clientIp);
-  if (!ip) return buf;
-  const prefixLen = ip.family === 1 ? ECS_V4_PREFIX : ECS_V6_PREFIX;
+// [修改2+3] injectECS 接受预解析的 IP 对象，避免在调用链上重复解析同一个 IP 字符串
+// 原因：handleRequest 已用 parseIp() 解析并校验 IP，此处不应再重复解析
+function injectECS(buf, parsedIp) {
+  if (!parsedIp) return buf;
+  const prefixLen = parsedIp.family === 1 ? ECS_V4_PREFIX : ECS_V6_PREFIX;
   let ecsOpt;
   try {
-    ecsOpt = buildEcsOption(ip.bytes, ip.family, prefixLen);
+    ecsOpt = buildEcsOption(parsedIp.bytes, parsedIp.family, prefixLen);
   } catch (e) {
     console.warn('Could not build ECS option:', e.message);
     return buf;
@@ -299,7 +306,7 @@ function injectECS(buf, clientIp) {
   );
   const newBuf = concatUint8(buf, optRecord);
   const newArCount = arCount + 1;
-  newBuf[DNS_CONSTANTS.OFFSET_AR] = (newArCount >> 8) & 0xff;
+  newBuf[DNS_CONSTANTS.OFFSET_AR]     = (newArCount >> 8) & 0xff;
   newBuf[DNS_CONSTANTS.OFFSET_AR + 1] = newArCount & 0xff;
   return newBuf;
 }
@@ -377,9 +384,11 @@ function allZero(buf, start, end) {
   return true;
 }
 
-function isPublicIPv4(ip) {
-  const b = parseIPv4(ip);
-  if (!b) return false;
+// [修改3] 将 IP 公网检测拆分为纯 bytes 版本，消除 isPublicIPv6 中的字符串 round-trip
+// 原版：从 bytes 拼成字符串 `${b[2]}.${b[3]}...`，再传给 isPublicIPv4 解析回 bytes，
+// 现版：直接在 bytes 上操作，无需字符串中转
+
+function isPublicIPv4Bytes(b) {
   const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
   const inRange = (base, mask) => (n & mask) >>> 0 === (base >>> 0);
   return !(
@@ -390,17 +399,16 @@ function isPublicIPv4(ip) {
   );
 }
 
-function isPublicIPv6(ip) {
-  const b = parseIPv6(ip);
-  if (!b) return false;
+function isPublicIPv6Bytes(b) {
   const [b0, b1, b2, b3] = b;
-  const isV4Mapped  = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
-  const isNAT64     = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
+  const isV4Mapped   = allZero(b, 0, 10) && b[10] === 0xff && b[11] === 0xff;
+  const isNAT64      = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && allZero(b, 4, 12);
   const isLocalNAT64 = b0 === 0x00 && b1 === 0x64 && b2 === 0xff && b3 === 0x9b && b[4] === 0x00 && b[5] === 0x01;
-  const is6to4      = b0 === 0x20 && b1 === 0x02;
+  const is6to4       = b0 === 0x20 && b1 === 0x02;
   if (isV4Mapped || isNAT64 || isLocalNAT64 || is6to4) {
-    const v4 = is6to4 ? `${b[2]}.${b[3]}.${b[4]}.${b[5]}` : `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
-    return isPublicIPv4(v4);
+    // 6to4 的 IPv4 嵌入在 bytes[2..5]；v4-mapped/NAT64 在 bytes[12..15]
+    const v4Bytes = is6to4 ? b.slice(2, 6) : b.slice(12, 16);
+    return isPublicIPv4Bytes(v4Bytes);
   }
   return !(
     allZero(b, 0, 16) || (allZero(b, 0, 15) && b[15] === 1) ||
@@ -411,9 +419,12 @@ function isPublicIPv6(ip) {
   );
 }
 
-function isPublicIp(ip) {
-  if (!ip || typeof ip !== 'string') return false;
-  return ip.includes(':') ? isPublicIPv6(ip) : isPublicIPv4(ip);
+// [修改2] 接受预解析的 IP 对象，由 handleRequest 统一解析后传入，无需重复 parseIp
+function isPublicParsedIp(parsed) {
+  if (!parsed) return false;
+  return parsed.family === 1
+    ? isPublicIPv4Bytes(parsed.bytes)
+    : isPublicIPv6Bytes(parsed.bytes);
 }
 
 // ================================================================
@@ -530,11 +541,12 @@ async function handleRequest(request, env, context) {
 
   if (dnsWire.length < DNS_CONSTANTS.HEADER_SIZE) return errResp('Invalid DNS message', 400);
 
-  const clientIP = getClientIP(request.headers, context);
+  // [修改2] parseIp 只调用一次，结果复用于公网检测和 ECS 注入，消除原有的双重解析
+  const parsedClientIP = parseIp(getClientIP(request.headers, context));
   let mutatedWire = dnsWire;
-  if (isPublicIp(clientIP)) {
+  if (isPublicParsedIp(parsedClientIP)) {
     try {
-      mutatedWire = injectECS(dnsWire, clientIP);
+      mutatedWire = injectECS(dnsWire, parsedClientIP);
     } catch (e) {
       console.warn('Failed to inject ECS:', e.message);
     }
